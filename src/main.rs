@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::Path ;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -53,6 +53,10 @@ struct CliArgs {
 
     #[arg(long, default_value = "5")]
     max_retries: usize,
+
+    /// output progress as JSON (compatible with silent mode)
+    #[arg(short = 'j', long, default_value = "false")]
+    json_output: bool,
 }
 
 struct DownloadConfig {
@@ -66,6 +70,7 @@ struct DownloadConfig {
     force: bool,
     timeout: Duration,
     max_retries: usize,
+    json_output: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -75,6 +80,16 @@ struct DownloadMetadata {
     completed_chunks: HashSet<u64>,
     last_modified: chrono::DateTime<chrono::Utc>,
     version: u8,
+}
+
+#[derive(Serialize, Debug)]
+struct ProgressInfo {
+    folder_name: String,
+    file_name: String,
+    file_size: u64,
+    progress: f64,
+    download_speed: f64,
+    bytes_downloaded: u64,
 }
 
 impl DownloadMetadata {
@@ -168,6 +183,19 @@ impl Downloader {
         if self.config.verbose && !self.config.silent {
             println!("Detected filename: {}", output_path);
         }
+
+        // Extract folder and file name for JSON output
+        let path = Path::new(&output_path);
+        let folder_name = path
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or(".")
+            .to_string();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
 
         let metadata_path = format!("{}.meta", output_path);
         let metadata = if Path::new(&metadata_path).exists()
@@ -292,6 +320,60 @@ impl Downloader {
             None
         };
 
+        // Track download progress for JSON output
+        let bytes_downloaded = Arc::new(Mutex::new(
+            metadata
+                .completed_chunks
+                .iter()
+                .map(|&chunk_id| {
+                    let start = chunk_id * (self.config.chunk_size as u64);
+                    let end = std::cmp::min(
+                        (chunk_id + 1) * (self.config.chunk_size as u64) - 1,
+                        file_size - 1,
+                    );
+                    end - start + 1
+                })
+                .sum(),
+        ));
+
+        // Setup JSON progress reporting if enabled
+        let json_reporter_handle = if self.config.json_output {
+            let folder_name_clone = folder_name.clone();
+            let file_name_clone = file_name.clone();
+            let bytes_downloaded_clone = Arc::clone(&bytes_downloaded);
+            let file_size_clone = file_size;
+
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                loop {
+                    interval.tick().await;
+                    let current_bytes = *bytes_downloaded_clone.lock().await;
+                    let progress = current_bytes as f64 / file_size_clone as f64 * 100.0;
+
+                    // Speed calculation - just an instantaneous value
+                    let download_speed = current_bytes as f64;
+
+                    let progress_info = ProgressInfo {
+                        folder_name: folder_name_clone.clone(),
+                        file_name: file_name_clone.clone(),
+                        file_size: file_size_clone,
+                        progress,
+                        download_speed,
+                        bytes_downloaded: current_bytes,
+                    };
+
+                    println!("{}", serde_json::to_string(&progress_info).unwrap());
+
+                    if current_bytes >= file_size_clone {
+                        break;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         let supports_range = self.check_range_support().await?;
         if !supports_range && self.config.num_connections > 1 {
             if !self.config.silent {
@@ -334,6 +416,9 @@ impl Downloader {
             1
         };
 
+        // Create a new Arc for tracking downloaded bytes that will be updated during download
+        let download_progress = Arc::clone(&bytes_downloaded);
+
         let mut tasks = FuturesUnordered::new();
 
         for (chunk_id, start, end) in chunks {
@@ -344,6 +429,7 @@ impl Downloader {
             let metadata_clone = Arc::clone(&metadata);
             let metadata_path_clone = Arc::clone(&metadata_path);
             let max_retries = self.config.max_retries;
+            let progress_tracker = Arc::clone(&download_progress);
 
             tasks.push(tokio::spawn(async move {
                 Self::download_chunk_with_retry(
@@ -358,6 +444,7 @@ impl Downloader {
                     metadata_path_clone,
                     max_retries,
                     supports_range,
+                    progress_tracker,
                 )
                 .await
             }));
@@ -371,6 +458,24 @@ impl Downloader {
 
         while let Some(result) = tasks.next().await {
             result??;
+        }
+
+        // Stop the JSON reporter if it was started
+        if let Some(handle) = json_reporter_handle {
+            handle.abort();
+        }
+
+        // Final progress update for JSON output
+        if self.config.json_output {
+            let progress_info = ProgressInfo {
+                folder_name,
+                file_name,
+                file_size,
+                progress: 100.0,
+                download_speed: 0.0, // Download is complete
+                bytes_downloaded: file_size,
+            };
+            println!("{}", serde_json::to_string(&progress_info).unwrap());
         }
 
         {
@@ -416,6 +521,7 @@ impl Downloader {
         metadata_path: Arc<String>,
         max_retries: usize,
         supports_range: bool,
+        download_progress: Arc<Mutex<u64>>,
     ) -> Result<()> {
         let mut retries = 0;
         loop {
@@ -430,6 +536,7 @@ impl Downloader {
                 metadata.clone(),
                 metadata_path.clone(),
                 supports_range,
+                download_progress.clone(),
             )
             .await
             {
@@ -458,6 +565,7 @@ impl Downloader {
         metadata: Arc<Mutex<DownloadMetadata>>,
         metadata_path: Arc<String>,
         supports_range: bool,
+        download_progress: Arc<Mutex<u64>>,
     ) -> Result<()> {
         let req = client.get(&url);
 
@@ -520,6 +628,12 @@ impl Downloader {
                 let written = (chunk_end - chunk_start) as u64;
                 position += written;
 
+                // Update the JSON progress tracker
+                {
+                    let mut progress = download_progress.lock().await;
+                    *progress += written;
+                }
+
                 if let Some(pb) = &progress_bar {
                     pb.inc(written);
                 }
@@ -534,6 +648,12 @@ impl Downloader {
                     writer.seek(SeekFrom::Start(position))?;
                     writer.write_all(&chunk[..remaining as usize])?;
 
+                    // Update the JSON progress tracker
+                    {
+                        let mut progress = download_progress.lock().await;
+                        *progress += remaining;
+                    }
+
                     if let Some(pb) = &progress_bar {
                         pb.inc(remaining);
                     }
@@ -546,6 +666,13 @@ impl Downloader {
                 drop(writer);
 
                 position += chunk_size;
+
+                // Update the JSON progress tracker
+                {
+                    let mut progress = download_progress.lock().await;
+                    *progress += chunk_size;
+                }
+
                 if let Some(pb) = &progress_bar {
                     pb.inc(chunk_size);
                 }
@@ -671,6 +798,7 @@ async fn main() -> Result<()> {
         force: args.force,
         timeout: Duration::from_secs(args.timeout),
         max_retries: args.max_retries,
+        json_output: args.json_output,
     };
 
     let downloader = Downloader::new(config)?;
