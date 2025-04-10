@@ -32,7 +32,7 @@ struct CliArgs {
     chunk_size: usize,
 
     /// buffer size in MB
-    #[arg(short, long, default_value = "8")]
+    #[arg(short, long, default_value = "16")]
     buffer_size: usize,
 
     #[arg(short = 'v', long, default_value = "false")]
@@ -95,19 +95,26 @@ impl Downloader {
         };
 
         let chunk_size = self.config.chunk_size as u64;
-        let mut tasks = FuturesUnordered::new();
+        let mut chunks = Vec::new();
 
         for i in 0..=(file_size / chunk_size) {
-            let start = i * chunk_size;
-            let end = std::cmp::min(start + chunk_size - 1, file_size - 1);
+            chunks.push((
+                i * chunk_size,
+                std::cmp::min((i + 1) * chunk_size - 1, file_size - 1),
+            ));
+        }
 
+        let mut tasks = FuturesUnordered::new();
+
+        for (start, end) in chunks {
             let client = self.client.clone();
             let url = self.config.url.clone();
             let file_clone = Arc::clone(&file);
             let pb_clone = progress_bar.clone();
 
             tasks.push(tokio::spawn(async move {
-                Self::download_chunk(client, url, start, end, file_clone, pb_clone).await
+                Self::download_chunk_with_retry(client, url, start, end, file_clone, pb_clone, 3)
+                    .await
             }));
 
             if tasks.len() >= self.config.num_connections {
@@ -131,6 +138,40 @@ impl Downloader {
         }
 
         Ok(())
+    }
+
+    async fn download_chunk_with_retry(
+        client: Client,
+        url: String,
+        start: u64,
+        end: u64,
+        file: Arc<Mutex<BufWriter<File>>>,
+        progress_bar: Option<ProgressBar>,
+        max_retries: usize,
+    ) -> Result<()> {
+        let mut retries = 0;
+        loop {
+            match Self::download_chunk(
+                client.clone(),
+                url.clone(),
+                start,
+                end,
+                file.clone(),
+                progress_bar.clone(),
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    retries += 1;
+                    if retries >= max_retries {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500 * retries as u64))
+                        .await;
+                }
+            }
+        }
     }
 
     async fn download_chunk(
@@ -176,7 +217,6 @@ impl Downloader {
             let mut writer = file.lock().await;
             writer.seek(SeekFrom::Start(position))?;
             writer.write_all(&chunk)?;
-            writer.flush()?;
             drop(writer);
 
             position += chunk_size;
