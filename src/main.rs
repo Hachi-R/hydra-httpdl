@@ -3,6 +3,7 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, StatusCode, Url};
+use serde_json::json;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -17,6 +18,7 @@ const DEFAULT_CHUNK_SIZE_MB: usize = 5;
 const DEFAULT_BUFFER_SIZE_MB: usize = 8;
 const DEFAULT_VERBOSE: bool = false;
 const DEFAULT_SILENT: bool = false;
+const DEFAULT_LOG: bool = false;
 
 #[derive(Parser)]
 #[command(name = "hydra-httpdl")]
@@ -49,6 +51,10 @@ struct CliArgs {
 
     #[arg(short = 's', long, default_value_t = DEFAULT_SILENT)]
     silent: bool,
+
+    /// log download statistics every second
+    #[arg(short = 'l', long, default_value_t = DEFAULT_LOG)]
+    log: bool,
 }
 
 struct DownloadConfig {
@@ -59,12 +65,26 @@ struct DownloadConfig {
     buffer_size: usize,
     verbose: bool,
     silent: bool,
+    log: bool,
 }
 
 impl DownloadConfig {
     fn should_log(&self) -> bool {
         self.verbose && !self.silent
     }
+
+    fn should_log_stats(&self) -> bool {
+        self.log
+    }
+}
+
+struct DownloadStats {
+    progress_percent: f64,
+    bytes_downloaded: u64,
+    total_size: u64,
+    speed_bytes_per_sec: f64,
+    eta_seconds: u64,
+    elapsed_seconds: u64,
 }
 
 struct ProgressTracker {
@@ -72,13 +92,16 @@ struct ProgressTracker {
 }
 
 impl ProgressTracker {
-    fn new(file_size: u64, silent: bool) -> Result<Self> {
-        let bar = if !silent {
+    fn new(file_size: u64, silent: bool, enable_stats: bool) -> Result<Self> {
+        let bar = if !silent || enable_stats {
             let pb = ProgressBar::new(file_size);
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
             );
+            if silent {
+                pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+            }
             Some(pb)
         } else {
             None
@@ -98,6 +121,24 @@ impl ProgressTracker {
             pb.finish_with_message("Download complete");
         }
     }
+
+    fn get_stats(&self) -> Option<DownloadStats> {
+        if let Some(pb) = &self.bar {
+            let position = pb.position();
+            let total = pb.length().unwrap_or(1);
+
+            Some(DownloadStats {
+                progress_percent: position as f64 / total as f64,
+                bytes_downloaded: position,
+                total_size: total,
+                speed_bytes_per_sec: pb.per_sec(),
+                eta_seconds: pb.eta().as_secs(),
+                elapsed_seconds: pb.elapsed().as_secs(),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 struct Downloader {
@@ -115,10 +156,10 @@ impl Downloader {
         }
 
         let file = self.prepare_output_file(&output_path, file_size)?;
-        let progress = ProgressTracker::new(file_size, self.config.silent)?;
+        let progress = ProgressTracker::new(file_size, self.config.silent, self.config.log)?;
 
         let chunks = self.calculate_chunks(file_size);
-        self.process_chunks(chunks, file, file_size, progress)
+        self.process_chunks(chunks, file, file_size, progress, output_path.clone())
             .await?;
 
         Ok(())
@@ -166,8 +207,42 @@ impl Downloader {
         file: Arc<Mutex<BufWriter<File>>>,
         _file_size: u64,
         progress: ProgressTracker,
+        real_filename: String,
     ) -> Result<()> {
         let mut tasks = FuturesUnordered::new();
+
+        let log_progress = if self.config.should_log_stats() {
+            let progress_clone = progress.bar.clone();
+            let filename = real_filename.clone();
+
+            let log_task = tokio::spawn(async move {
+                let interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+                let mut interval = interval;
+
+                let tracker = ProgressTracker {
+                    bar: progress_clone,
+                };
+
+                loop {
+                    interval.tick().await;
+                    if let Some(stats) = tracker.get_stats() {
+                        let json_output = json!({
+                            "progress": stats.progress_percent,
+                            "speed_bps": stats.speed_bytes_per_sec,
+                            "downloaded_bytes": stats.bytes_downloaded,
+                            "total_bytes": stats.total_size,
+                            "eta_seconds": stats.eta_seconds,
+                            "elapsed_seconds": stats.elapsed_seconds,
+                            "filename": filename
+                        });
+                        println!("{}", json_output);
+                    }
+                }
+            });
+            Some(log_task)
+        } else {
+            None
+        };
 
         for (start, end) in chunks {
             let client = self.client.clone();
@@ -205,6 +280,10 @@ impl Downloader {
         }
 
         progress.finish();
+
+        if let Some(log_handle) = log_progress {
+            log_handle.abort();
+        }
 
         Ok(())
     }
@@ -376,6 +455,7 @@ async fn main() -> Result<()> {
         buffer_size: args.buffer_size * 1024 * 1024,
         verbose: args.verbose,
         silent: args.silent,
+        log: args.log,
     };
 
     let downloader = Downloader {
