@@ -345,21 +345,23 @@ impl Downloader {
 
             Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
+                let mut last_bytes = 0u64;
 
                 loop {
                     interval.tick().await;
                     let current_bytes = *bytes_downloaded_clone.lock().await;
                     let progress = current_bytes as f64 / file_size_clone as f64 * 100.0;
 
-                    // Speed calculation - just an instantaneous value
-                    let download_speed = current_bytes as f64;
+                    // Calcula a velocidade em bytes por segundo
+                    let download_speed = (current_bytes - last_bytes) as f64; // Bytes/s
+                    last_bytes = current_bytes;
 
                     let progress_info = ProgressInfo {
                         folder_name: folder_name_clone.clone(),
                         file_name: file_name_clone.clone(),
                         file_size: file_size_clone,
                         progress,
-                        download_speed,
+                        download_speed, // Agora em bytes/s
                         bytes_downloaded: current_bytes,
                     };
 
