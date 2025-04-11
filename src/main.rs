@@ -1,11 +1,13 @@
 use anyhow::Result;
+use bitvec::prelude::*;
 use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, StatusCode, Url};
 use serde_json::json;
-use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -19,42 +21,57 @@ const DEFAULT_BUFFER_SIZE_MB: usize = 8;
 const DEFAULT_VERBOSE: bool = false;
 const DEFAULT_SILENT: bool = false;
 const DEFAULT_LOG: bool = false;
+const DEFAULT_FORCE_NEW: bool = false;
+const DEFAULT_RESUME_ONLY: bool = false;
+const HEADER_SIZE: usize = 4096;
+const MAGIC_NUMBER: &[u8; 5] = b"HYDRA";
+const FORMAT_VERSION: u8 = 1;
 
 #[derive(Parser)]
 #[command(name = "hydra-httpdl")]
 #[command(author = "los-broxas")]
-#[command(version = "0.1.3")]
-#[command(about = "high speed and low resource usage http downloader", long_about = None)]
+#[command(version = "0.2.0")]
+#[command(about = "high speed and low resource usage http downloader with resume capability", long_about = None)]
 struct CliArgs {
-    /// file url
+    /// file url to download
     #[arg(required = true)]
     url: String,
 
-    /// output file path
+    /// output file path (or directory to save with original filename)
     #[arg(default_value = DEFAULT_OUTPUT_FILENAME)]
     output: String,
 
-    /// number of concurrent connections
+    /// number of concurrent connections for parallel download
     #[arg(short = 'c', long, default_value_t = DEFAULT_CONNECTIONS)]
     connections: usize,
 
-    /// chunk size in MB
+    /// chunk size in MB for each connection
     #[arg(short = 'k', long, default_value_t = DEFAULT_CHUNK_SIZE_MB)]
     chunk_size: usize,
 
-    /// buffer size in MB
+    /// buffer size in MB for file writing
     #[arg(short, long, default_value_t = DEFAULT_BUFFER_SIZE_MB)]
     buffer_size: usize,
 
+    /// show detailed progress information
     #[arg(short = 'v', long, default_value_t = DEFAULT_VERBOSE)]
     verbose: bool,
 
+    /// suppress progress bar
     #[arg(short = 's', long, default_value_t = DEFAULT_SILENT)]
     silent: bool,
 
-    /// log download statistics every second
+    /// log download statistics in JSON format every second
     #[arg(short = 'l', long, default_value_t = DEFAULT_LOG)]
     log: bool,
+
+    /// force new download, ignore existing partial files
+    #[arg(short = 'f', long, default_value_t = DEFAULT_FORCE_NEW)]
+    force_new: bool,
+
+    /// only resume existing download, exit if no partial file exists
+    #[arg(short = 'r', long, default_value_t = DEFAULT_RESUME_ONLY)]
+    resume_only: bool,
 }
 
 struct DownloadConfig {
@@ -66,6 +83,8 @@ struct DownloadConfig {
     verbose: bool,
     silent: bool,
     log: bool,
+    force_new: bool,
+    resume_only: bool,
 }
 
 impl DownloadConfig {
@@ -85,6 +104,152 @@ struct DownloadStats {
     speed_bytes_per_sec: f64,
     eta_seconds: u64,
     elapsed_seconds: u64,
+}
+
+struct HydraHeader {
+    magic: [u8; 5],            // "HYDRA" identifier
+    version: u8,               // header version
+    file_size: u64,            // file size
+    etag: [u8; 32],            // etag hash
+    url_hash: [u8; 32],        // url hash
+    chunk_size: u32,           // chunk size
+    chunk_count: u32,          // chunk count
+    chunks_bitmap: BitVec<u8>, // chunks bitmap
+}
+
+impl HydraHeader {
+    fn new(file_size: u64, etag: &str, url: &str, chunk_size: u32) -> Self {
+        let chunk_count = ((file_size as f64) / (chunk_size as f64)).ceil() as u32;
+        let chunks_bitmap = bitvec![u8, Lsb0; 0; chunk_count as usize];
+
+        let mut etag_hash = [0u8; 32];
+        let etag_digest = Sha256::digest(etag.as_bytes());
+        etag_hash.copy_from_slice(&etag_digest[..]);
+
+        let mut url_hash = [0u8; 32];
+        let url_digest = Sha256::digest(url.as_bytes());
+        url_hash.copy_from_slice(&url_digest[..]);
+
+        Self {
+            magic: *MAGIC_NUMBER,
+            version: FORMAT_VERSION,
+            file_size,
+            etag: etag_hash,
+            url_hash,
+            chunk_size,
+            chunk_count,
+            chunks_bitmap,
+        }
+    }
+
+    fn write_to_file<W: Write + Seek>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(&self.magic)?;
+        writer.write_all(&[self.version])?;
+        writer.write_all(&self.file_size.to_le_bytes())?;
+        writer.write_all(&self.etag)?;
+        writer.write_all(&self.url_hash)?;
+        writer.write_all(&self.chunk_size.to_le_bytes())?;
+        writer.write_all(&self.chunk_count.to_le_bytes())?;
+
+        let bitmap_bytes = self.chunks_bitmap.as_raw_slice();
+        writer.write_all(bitmap_bytes)?;
+
+        let header_size = 5 + 1 + 8 + 32 + 32 + 4 + 4 + bitmap_bytes.len();
+        let padding_size = HEADER_SIZE - header_size;
+        let padding = vec![0u8; padding_size];
+        writer.write_all(&padding)?;
+
+        Ok(())
+    }
+
+    fn read_from_file<R: Read + Seek>(reader: &mut R) -> Result<Self> {
+        let mut magic = [0u8; 5];
+        reader.read_exact(&mut magic)?;
+
+        if magic != *MAGIC_NUMBER {
+            anyhow::bail!("Not a valid Hydra download file");
+        }
+
+        let mut version = [0u8; 1];
+        reader.read_exact(&mut version)?;
+
+        if version[0] != FORMAT_VERSION {
+            anyhow::bail!("Incompatible format version");
+        }
+
+        let mut file_size_bytes = [0u8; 8];
+        reader.read_exact(&mut file_size_bytes)?;
+        let file_size = u64::from_le_bytes(file_size_bytes);
+
+        let mut etag = [0u8; 32];
+        reader.read_exact(&mut etag)?;
+
+        let mut url_hash = [0u8; 32];
+        reader.read_exact(&mut url_hash)?;
+
+        let mut chunk_size_bytes = [0u8; 4];
+        reader.read_exact(&mut chunk_size_bytes)?;
+        let chunk_size = u32::from_le_bytes(chunk_size_bytes);
+
+        let mut chunk_count_bytes = [0u8; 4];
+        reader.read_exact(&mut chunk_count_bytes)?;
+        let chunk_count = u32::from_le_bytes(chunk_count_bytes);
+
+        let bitmap_bytes_len = (chunk_count as usize + 7) / 8;
+        let mut bitmap_bytes = vec![0u8; bitmap_bytes_len];
+        reader.read_exact(&mut bitmap_bytes)?;
+
+        let chunks_bitmap = BitVec::<u8, Lsb0>::from_vec(bitmap_bytes);
+
+        reader.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+
+        Ok(Self {
+            magic,
+            version: version[0],
+            file_size,
+            etag,
+            url_hash,
+            chunk_size,
+            chunk_count,
+            chunks_bitmap,
+        })
+    }
+
+    fn set_chunk_complete(&mut self, chunk_index: usize) -> Result<()> {
+        if chunk_index >= self.chunk_count as usize {
+            anyhow::bail!("Chunk index out of bounds");
+        }
+
+        self.chunks_bitmap.set(chunk_index, true);
+        Ok(())
+    }
+
+    fn is_chunk_complete(&self, chunk_index: usize) -> bool {
+        if chunk_index >= self.chunk_count as usize {
+            return false;
+        }
+
+        self.chunks_bitmap[chunk_index]
+    }
+
+    fn get_incomplete_chunks(&self) -> Vec<(u64, u64)> {
+        let mut chunks = Vec::new();
+        let chunk_size = self.chunk_size as u64;
+
+        for i in 0..self.chunk_count as usize {
+            if !self.is_chunk_complete(i) {
+                let start = i as u64 * chunk_size;
+                let end = std::cmp::min((i as u64 + 1) * chunk_size - 1, self.file_size - 1);
+                chunks.push((start, end));
+            }
+        }
+
+        chunks
+    }
+
+    fn is_download_complete(&self) -> bool {
+        self.chunks_bitmap.count_ones() == self.chunk_count as usize
+    }
 }
 
 struct ProgressTracker {
@@ -148,19 +313,68 @@ struct Downloader {
 
 impl Downloader {
     async fn download(&self) -> Result<()> {
-        let (file_size, filename) = self.get_file_info().await?;
+        let (file_size, filename, etag) = self.get_file_info().await?;
         let output_path = self.determine_output_path(filename);
 
         if self.config.should_log() {
             println!("Detected filename: {}", output_path);
         }
 
+        let resume_manager = ResumeManager::try_from_file(
+            &output_path,
+            file_size,
+            &etag,
+            &self.config.url,
+            self.config.chunk_size as u32,
+            self.config.force_new,
+            self.config.resume_only,
+        )?;
+
         let file = self.prepare_output_file(&output_path, file_size)?;
         let progress = ProgressTracker::new(file_size, self.config.silent, self.config.log)?;
 
-        let chunks = self.calculate_chunks(file_size);
-        self.process_chunks(chunks, file, file_size, progress, output_path.clone())
-            .await?;
+        let chunks = if resume_manager.is_download_complete() {
+            if self.config.should_log() {
+                println!("File is already fully downloaded, finalizing...");
+            }
+            resume_manager.finalize_download()?;
+            return Ok(());
+        } else {
+            let completed_chunks = resume_manager.header.chunks_bitmap.count_ones() as u32;
+            let total_chunks = resume_manager.header.chunk_count;
+
+            if completed_chunks > 0 {
+                if self.config.should_log() {
+                    let percent_done = (completed_chunks as f64 / total_chunks as f64) * 100.0;
+                    println!("Resuming download: {:.1}% already downloaded", percent_done);
+                }
+
+                if let Some(pb) = &progress.bar {
+                    let downloaded = file_size * completed_chunks as u64 / total_chunks as u64;
+                    pb.inc(downloaded);
+                }
+            }
+
+            resume_manager.get_incomplete_chunks()
+        };
+
+        if self.config.should_log() {
+            println!(
+                "Downloading {} chunks of total {}",
+                chunks.len(),
+                resume_manager.header.chunk_count
+            );
+        }
+
+        self.process_chunks_with_resume(
+            chunks,
+            file,
+            file_size,
+            progress,
+            output_path.clone(),
+            resume_manager,
+        )
+        .await?;
 
         Ok(())
     }
@@ -179,35 +393,28 @@ impl Downloader {
     }
 
     fn prepare_output_file(&self, path: &str, size: u64) -> Result<Arc<Mutex<BufWriter<File>>>> {
-        let file = File::create(path)?;
-        file.set_len(size)?;
+        let file = if Path::new(path).exists() {
+            OpenOptions::new().read(true).write(true).open(path)?
+        } else {
+            let file = File::create(path)?;
+            file.set_len(HEADER_SIZE as u64 + size)?;
+            file
+        };
+
         Ok(Arc::new(Mutex::new(BufWriter::with_capacity(
             self.config.buffer_size,
             file,
         ))))
     }
 
-    fn calculate_chunks(&self, file_size: u64) -> Vec<(u64, u64)> {
-        let chunk_size = self.config.chunk_size as u64;
-        let mut chunks = Vec::new();
-
-        for i in 0..=(file_size / chunk_size) {
-            chunks.push((
-                i * chunk_size,
-                std::cmp::min((i + 1) * chunk_size - 1, file_size - 1),
-            ));
-        }
-
-        chunks
-    }
-
-    async fn process_chunks(
+    async fn process_chunks_with_resume(
         &self,
         chunks: Vec<(u64, u64)>,
         file: Arc<Mutex<BufWriter<File>>>,
         _file_size: u64,
         progress: ProgressTracker,
         real_filename: String,
+        resume_manager: ResumeManager,
     ) -> Result<()> {
         let mut tasks = FuturesUnordered::new();
 
@@ -216,9 +423,7 @@ impl Downloader {
             let filename = real_filename.clone();
 
             let log_task = tokio::spawn(async move {
-                let interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-                let mut interval = interval;
-
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
                 let tracker = ProgressTracker {
                     bar: progress_clone,
                 };
@@ -244,14 +449,20 @@ impl Downloader {
             None
         };
 
+        let resume_manager = Arc::new(Mutex::new(resume_manager));
+
         for (start, end) in chunks {
             let client = self.client.clone();
             let url = self.config.url.clone();
             let file_clone = Arc::clone(&file);
             let pb_clone = progress.bar.clone();
+            let manager_clone = Arc::clone(&resume_manager);
+
+            let chunk_size = self.config.chunk_size as u64;
+            let chunk_index = (start / chunk_size) as usize;
 
             tasks.push(tokio::spawn(async move {
-                Self::download_chunk_with_retry(
+                let result = Self::download_chunk_with_retry(
                     client,
                     url,
                     start,
@@ -260,7 +471,14 @@ impl Downloader {
                     pb_clone,
                     DEFAULT_MAX_RETRIES,
                 )
-                .await
+                .await;
+
+                if result.is_ok() {
+                    let mut manager = manager_clone.lock().await;
+                    manager.set_chunk_complete(chunk_index)?;
+                }
+
+                result
             }));
 
             if tasks.len() >= self.config.num_connections {
@@ -283,6 +501,14 @@ impl Downloader {
 
         if let Some(log_handle) = log_progress {
             log_handle.abort();
+        }
+
+        let manager = resume_manager.lock().await;
+        if manager.is_download_complete() {
+            if self.config.should_log() {
+                println!("Download complete, finalizing file...");
+            }
+            manager.finalize_download()?;
         }
 
         Ok(())
@@ -355,7 +581,7 @@ impl Downloader {
             if total_bytes > expected_bytes {
                 let remaining = expected_bytes - (total_bytes - chunk_size);
                 let mut writer = file.lock().await;
-                writer.seek(SeekFrom::Start(position))?;
+                writer.seek(SeekFrom::Start(HEADER_SIZE as u64 + position))?;
                 writer.write_all(&chunk[..remaining as usize])?;
 
                 let tracker = ProgressTracker {
@@ -366,7 +592,7 @@ impl Downloader {
             }
 
             let mut writer = file.lock().await;
-            writer.seek(SeekFrom::Start(position))?;
+            writer.seek(SeekFrom::Start(HEADER_SIZE as u64 + position))?;
             writer.write_all(&chunk)?;
             drop(writer);
 
@@ -380,7 +606,7 @@ impl Downloader {
         Ok(())
     }
 
-    async fn get_file_info(&self) -> Result<(u64, Option<String>)> {
+    async fn get_file_info(&self) -> Result<(u64, Option<String>, String)> {
         let resp = self.client.head(&self.config.url).send().await?;
 
         let file_size = if let Some(content_length) = resp.headers().get("content-length") {
@@ -389,12 +615,24 @@ impl Downloader {
             anyhow::bail!("Could not determine file size")
         };
 
-        let filename = self.extract_filename_from_response(&resp).await;
+        let etag = if let Some(etag_header) = resp.headers().get("etag") {
+            etag_header.to_str()?.to_string()
+        } else {
+            format!(
+                "no-etag-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            )
+        };
 
-        Ok((file_size, filename))
+        let filename = self.extract_filename_from_response(&resp);
+
+        Ok((file_size, filename, etag))
     }
 
-    async fn extract_filename_from_response(&self, resp: &reqwest::Response) -> Option<String> {
+    fn extract_filename_from_response(&self, resp: &reqwest::Response) -> Option<String> {
         if let Some(disposition) = resp.headers().get("content-disposition") {
             if let Ok(disposition_str) = disposition.to_str() {
                 if let Some(filename) = Self::parse_content_disposition(disposition_str) {
@@ -443,6 +681,138 @@ impl Downloader {
     }
 }
 
+struct ResumeManager {
+    header: HydraHeader,
+    file_path: String,
+}
+
+impl ResumeManager {
+    fn try_from_file(
+        path: &str,
+        file_size: u64,
+        etag: &str,
+        url: &str,
+        chunk_size: u32,
+        force_new: bool,
+        resume_only: bool,
+    ) -> Result<Self> {
+        if force_new {
+            if Path::new(path).exists() {
+                std::fs::remove_file(path)?;
+            }
+
+            return Self::create_new_file(path, file_size, etag, url, chunk_size);
+        }
+
+        if let Ok(file) = File::open(path) {
+            let mut reader = BufReader::new(file);
+            match HydraHeader::read_from_file(&mut reader) {
+                Ok(header) => {
+                    let current_url_hash = Sha256::digest(url.as_bytes());
+                    let current_etag_hash = Sha256::digest(etag.as_bytes());
+
+                    let url_matches = header.url_hash == current_url_hash.as_slice();
+                    let etag_matches = header.etag == current_etag_hash.as_slice();
+                    let size_matches = header.file_size == file_size;
+
+                    if url_matches && etag_matches && size_matches {
+                        return Ok(Self {
+                            header,
+                            file_path: path.to_string(),
+                        });
+                    }
+
+                    if resume_only {
+                        anyhow::bail!(
+                            "Existing file is not compatible and resume_only option is active"
+                        );
+                    }
+
+                    std::fs::remove_file(path)?;
+                }
+                Err(e) => {
+                    if resume_only {
+                        return Err(anyhow::anyhow!("Could not read file to resume: {}", e));
+                    }
+
+                    std::fs::remove_file(path)?;
+                }
+            }
+        } else if resume_only {
+            anyhow::bail!("File not found and resume_only option is active");
+        }
+
+        Self::create_new_file(path, file_size, etag, url, chunk_size)
+    }
+
+    fn create_new_file(
+        path: &str,
+        file_size: u64,
+        etag: &str,
+        url: &str,
+        chunk_size: u32,
+    ) -> Result<Self> {
+        let header = HydraHeader::new(file_size, etag, url, chunk_size);
+        let file = File::create(path)?;
+        file.set_len(HEADER_SIZE as u64 + file_size)?;
+
+        let mut writer = BufWriter::new(file);
+        header.write_to_file(&mut writer)?;
+        writer.flush()?;
+
+        Ok(Self {
+            header,
+            file_path: path.to_string(),
+        })
+    }
+
+    fn get_incomplete_chunks(&self) -> Vec<(u64, u64)> {
+        self.header.get_incomplete_chunks()
+    }
+
+    fn set_chunk_complete(&mut self, chunk_index: usize) -> Result<()> {
+        self.header.set_chunk_complete(chunk_index)?;
+
+        let file = OpenOptions::new().write(true).open(&self.file_path)?;
+        let mut writer = BufWriter::new(file);
+
+        let bitmap_offset = 5 + 1 + 8 + 32 + 32 + 4 + 4;
+        writer.seek(SeekFrom::Start(bitmap_offset as u64))?;
+
+        let bitmap_bytes = self.header.chunks_bitmap.as_raw_slice();
+        writer.write_all(bitmap_bytes)?;
+        writer.flush()?;
+
+        Ok(())
+    }
+
+    fn is_download_complete(&self) -> bool {
+        self.header.is_download_complete()
+    }
+
+    fn finalize_download(&self) -> Result<()> {
+        if !self.is_download_complete() {
+            anyhow::bail!("Download is not complete");
+        }
+
+        let temp_path = format!("{}.tmp", self.file_path);
+        let source = File::open(&self.file_path)?;
+        let dest = File::create(&temp_path)?;
+
+        let mut reader = BufReader::new(source);
+        let mut writer = BufWriter::new(dest);
+
+        reader.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+
+        std::io::copy(&mut reader, &mut writer)?;
+        writer.flush()?;
+
+        std::fs::rename(temp_path, &self.file_path)?;
+
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -456,7 +826,14 @@ async fn main() -> Result<()> {
         verbose: args.verbose,
         silent: args.silent,
         log: args.log,
+        force_new: args.force_new,
+        resume_only: args.resume_only,
     };
+
+    if config.force_new && config.resume_only {
+        eprintln!("Error: --force-new and --resume-only options cannot be used together");
+        std::process::exit(1);
+    }
 
     let downloader = Downloader {
         client: Client::new(),
@@ -469,6 +846,14 @@ async fn main() -> Result<()> {
             downloader.config.num_connections, args.chunk_size, args.buffer_size
         );
         println!("URL: {}", args.url);
+
+        if downloader.config.force_new {
+            println!("Forcing new download, ignoring existing files");
+        } else if downloader.config.resume_only {
+            println!("Only resuming existing download");
+        } else {
+            println!("Resuming download if possible");
+        }
     }
 
     downloader.download().await?;
